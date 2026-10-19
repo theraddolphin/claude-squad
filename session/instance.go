@@ -93,6 +93,7 @@ func (i *Instance) ToInstanceData() InstanceData {
 			BaseCommitSHA:    i.gitWorktree.GetBaseCommitSHA(),
 			IsExistingBranch: i.gitWorktree.IsExistingBranch(),
 			Linked:           i.gitWorktree.LinkedStates(),
+			Slot:             i.gitWorktree.Slot(),
 		}
 	}
 
@@ -135,6 +136,7 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		},
 	}
 	instance.gitWorktree.SetLinkedStates(data.Worktree.Linked)
+	instance.gitWorktree.SetSlot(data.Worktree.Slot)
 
 	if instance.Paused() {
 		instance.started = true

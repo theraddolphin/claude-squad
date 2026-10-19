@@ -36,6 +36,8 @@ type GitWorktree struct {
 	alias string
 	// linked holds worktrees of other repos that share this session's branch.
 	linked []*GitWorktree
+	// slot is this session's port slot (1-based, 0 = none); only sessions with linked repos get one.
+	slot int
 }
 
 func NewGitWorktreeFromStorage(repoPath string, worktreePath string, sessionName string, branchName string, baseCommitSHA string, isExistingBranch bool) *GitWorktree {

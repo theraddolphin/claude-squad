@@ -83,6 +83,12 @@ func (g *GitWorktree) LinkedStates() []LinkedState {
 	return states
 }
 
+// Slot returns the session's port slot (0 if none).
+func (g *GitWorktree) Slot() int { return g.slot }
+
+// SetSlot restores the port slot from storage.
+func (g *GitWorktree) SetSlot(slot int) { g.slot = slot }
+
 // SetLinkedStates restores linked worktrees from storage.
 func (g *GitWorktree) SetLinkedStates(states []LinkedState) {
 	g.linked = nil
@@ -119,6 +125,13 @@ func (g *GitWorktree) Setup() error {
 			return fmt.Errorf("failed to link %s into session: %w", l.alias, err)
 		}
 	}
+	if len(g.linked) == 0 {
+		return nil
+	}
+	if err := g.claimSlot(); err != nil {
+		return err
+	}
+	g.runHook("setup")
 	return nil
 }
 
@@ -173,6 +186,10 @@ func (l *GitWorktree) defaultRef() string {
 // Cleanup removes all worktrees and the branches this session created.
 func (g *GitWorktree) Cleanup() error {
 	var errs []error
+	if len(g.linked) > 0 {
+		g.runHook("teardown")
+		g.releaseSlot()
+	}
 	for _, l := range g.linked {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
 		if err := l.CleanupSelf(); err != nil {

@@ -35,6 +35,8 @@ type GitWorktreeData struct {
 	IsExistingBranch bool   `json:"is_existing_branch"`
 	// Linked holds worktrees of other repos that share the session branch.
 	Linked []git.LinkedState `json:"linked,omitempty"`
+	// Slot is the session's port slot for linked-repo sessions (0 = none).
+	Slot int `json:"slot,omitempty"`
 }
 
 // DiffStatsData represents the serializable data of a DiffStats
