@@ -32,6 +32,10 @@ type GitWorktree struct {
 	// isExistingBranch is true if the branch existed before the session was created.
 	// When true, the branch will not be deleted on cleanup.
 	isExistingBranch bool
+	// alias is the directory name a linked worktree is exposed as inside its parent.
+	alias string
+	// linked holds worktrees of other repos that share this session's branch.
+	linked []*GitWorktree
 }
 
 func NewGitWorktreeFromStorage(repoPath string, worktreePath string, sessionName string, branchName string, baseCommitSHA string, isExistingBranch bool) *GitWorktree {
@@ -82,12 +86,16 @@ func NewGitWorktree(repoPath string, sessionName string) (tree *GitWorktree, bra
 		return nil, "", err
 	}
 
-	return &GitWorktree{
+	g := &GitWorktree{
 		repoPath:     repoPath,
 		sessionName:  sessionName,
 		branchName:   branchName,
 		worktreePath: worktreePath,
-	}, branchName, nil
+	}
+	if err := g.attachLinked(); err != nil {
+		return nil, "", err
+	}
+	return g, branchName, nil
 }
 
 // NewGitWorktreeFromBranch creates a new GitWorktree that uses an existing branch.
@@ -98,13 +106,17 @@ func NewGitWorktreeFromBranch(repoPath string, branchName string, sessionName st
 		return nil, err
 	}
 
-	return &GitWorktree{
+	g := &GitWorktree{
 		repoPath:         repoPath,
 		sessionName:      sessionName,
 		branchName:       branchName,
 		worktreePath:     worktreePath,
 		isExistingBranch: true,
-	}, nil
+	}
+	if err := g.attachLinked(); err != nil {
+		return nil, err
+	}
+	return g, nil
 }
 
 // IsExistingBranch returns whether this worktree uses a pre-existing branch

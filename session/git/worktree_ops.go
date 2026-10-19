@@ -10,7 +10,7 @@ import (
 )
 
 // Setup creates a new worktree for the session
-func (g *GitWorktree) Setup() error {
+func (g *GitWorktree) SetupSelf() error {
 	// Ensure worktrees directory exists early (can be done in parallel with branch check)
 	worktreesDir, err := getWorktreeDirectory()
 	if err != nil {
@@ -113,7 +113,7 @@ func (g *GitWorktree) setupNewWorktree() error {
 }
 
 // Cleanup removes the worktree and associated branch
-func (g *GitWorktree) Cleanup() error {
+func (g *GitWorktree) CleanupSelf() error {
 	var errs []error
 
 	// Check if worktree path exists before attempting removal
@@ -138,7 +138,7 @@ func (g *GitWorktree) Cleanup() error {
 	}
 
 	// Prune the worktree to clean up any remaining references
-	if err := g.Prune(); err != nil {
+	if err := g.PruneSelf(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -150,7 +150,7 @@ func (g *GitWorktree) Cleanup() error {
 }
 
 // Remove removes the worktree but keeps the branch
-func (g *GitWorktree) Remove() error {
+func (g *GitWorktree) RemoveSelf() error {
 	// Remove the worktree using git command
 	if _, err := g.runGitCommand(g.repoPath, "worktree", "remove", "-f", g.worktreePath); err != nil {
 		return fmt.Errorf("failed to remove worktree: %w", err)
@@ -160,7 +160,7 @@ func (g *GitWorktree) Remove() error {
 }
 
 // Prune removes all working tree administrative files and directories
-func (g *GitWorktree) Prune() error {
+func (g *GitWorktree) PruneSelf() error {
 	if _, err := g.runGitCommand(g.repoPath, "worktree", "prune"); err != nil {
 		return fmt.Errorf("failed to prune worktrees: %w", err)
 	}

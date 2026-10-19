@@ -92,6 +92,7 @@ func (i *Instance) ToInstanceData() InstanceData {
 			BranchName:       i.gitWorktree.GetBranchName(),
 			BaseCommitSHA:    i.gitWorktree.GetBaseCommitSHA(),
 			IsExistingBranch: i.gitWorktree.IsExistingBranch(),
+			Linked:           i.gitWorktree.LinkedStates(),
 		}
 	}
 
@@ -133,6 +134,7 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 			Content: data.DiffStats.Content,
 		},
 	}
+	instance.gitWorktree.SetLinkedStates(data.Worktree.Linked)
 
 	if instance.Paused() {
 		instance.started = true

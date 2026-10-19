@@ -68,13 +68,13 @@ func (g *GitWorktree) runGitCommand(path string, args ...string) (string, error)
 }
 
 // PushChanges commits and pushes changes in the worktree to the remote branch
-func (g *GitWorktree) PushChanges(commitMessage string, open bool) error {
+func (g *GitWorktree) PushChangesSelf(commitMessage string, open bool) error {
 	if err := checkGHCLI(); err != nil {
 		return err
 	}
 
 	// Check if there are any changes to commit
-	isDirty, err := g.IsDirty()
+	isDirty, err := g.IsDirtySelf()
 	if err != nil {
 		return fmt.Errorf("failed to check for changes: %w", err)
 	}
@@ -126,9 +126,9 @@ func (g *GitWorktree) PushChanges(commitMessage string, open bool) error {
 }
 
 // CommitChanges commits changes locally without pushing to remote
-func (g *GitWorktree) CommitChanges(commitMessage string) error {
+func (g *GitWorktree) CommitChangesSelf(commitMessage string) error {
 	// Check if there are any changes to commit
-	isDirty, err := g.IsDirty()
+	isDirty, err := g.IsDirtySelf()
 	if err != nil {
 		return fmt.Errorf("failed to check for changes: %w", err)
 	}
@@ -151,7 +151,7 @@ func (g *GitWorktree) CommitChanges(commitMessage string) error {
 }
 
 // IsDirty checks if the worktree has uncommitted changes
-func (g *GitWorktree) IsDirty() (bool, error) {
+func (g *GitWorktree) IsDirtySelf() (bool, error) {
 	output, err := g.runGitCommand(g.worktreePath, "status", "--porcelain")
 	if err != nil {
 		return false, fmt.Errorf("failed to check worktree status: %w", err)
@@ -162,7 +162,7 @@ func (g *GitWorktree) IsDirty() (bool, error) {
 // IsValidWorktree reports whether the worktree path exists and contains a
 // .git entry, i.e. git can still recognize it as a working tree.
 // Returns (false, nil) if the worktree is orphaned (path or .git missing).
-func (g *GitWorktree) IsValidWorktree() (bool, error) {
+func (g *GitWorktree) IsValidWorktreeSelf() (bool, error) {
 	if _, err := os.Stat(g.worktreePath); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -179,7 +179,7 @@ func (g *GitWorktree) IsValidWorktree() (bool, error) {
 }
 
 // IsBranchCheckedOut checks if the instance branch is currently checked out
-func (g *GitWorktree) IsBranchCheckedOut() (bool, error) {
+func (g *GitWorktree) IsBranchCheckedOutSelf() (bool, error) {
 	output, err := g.runGitCommand(g.repoPath, "branch", "--show-current")
 	if err != nil {
 		return false, fmt.Errorf("failed to get current branch: %w", err)

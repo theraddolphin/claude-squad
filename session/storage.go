@@ -2,6 +2,7 @@ package session
 
 import (
 	"claude-squad/config"
+	"claude-squad/session/git"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -32,6 +33,8 @@ type GitWorktreeData struct {
 	BranchName       string `json:"branch_name"`
 	BaseCommitSHA    string `json:"base_commit_sha"`
 	IsExistingBranch bool   `json:"is_existing_branch"`
+	// Linked holds worktrees of other repos that share the session branch.
+	Linked []git.LinkedState `json:"linked,omitempty"`
 }
 
 // DiffStatsData represents the serializable data of a DiffStats

@@ -23,7 +23,7 @@ func (d *DiffStats) IsEmpty() bool {
 }
 
 // Diff returns the git diff between the worktree and the base branch along with statistics
-func (g *GitWorktree) Diff() *DiffStats {
+func (g *GitWorktree) DiffSelf() *DiffStats {
 	stats := &DiffStats{}
 
 	// -N stages untracked files (intent to add), including them in the diff
@@ -54,7 +54,7 @@ func (g *GitWorktree) Diff() *DiffStats {
 // DiffNumstat returns the added/removed line counts between the worktree and the
 // base branch without loading the full diff content into memory. Use this when
 // only the summary counts are needed (e.g. for unselected instances in the list).
-func (g *GitWorktree) DiffNumstat() *DiffStats {
+func (g *GitWorktree) DiffNumstatSelf() *DiffStats {
 	stats := &DiffStats{}
 
 	// -N stages untracked files (intent to add), including them in the diff
