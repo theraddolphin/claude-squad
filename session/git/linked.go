@@ -270,8 +270,9 @@ func (g *GitWorktree) Cleanup() error {
 		errs = append(errs, err)
 	}
 	if len(g.linked) > 0 {
-		_ = os.Remove(g.worktreePath + ".setup.log")
-		_ = os.Remove(g.worktreePath + ".teardown.log")
+		for _, hook := range []string{"setup", "pause", "teardown"} {
+			_ = os.Remove(g.worktreePath + "." + hook + ".log")
+		}
 	}
 	if len(errs) > 0 {
 		return g.combineErrors(errs)
@@ -279,8 +280,12 @@ func (g *GitWorktree) Cleanup() error {
 	return nil
 }
 
-// Remove removes all worktrees but keeps their branches.
+// Remove removes all worktrees but keeps their branches (pause). The pause hook runs first
+// so it can set aside untracked state worth keeping, like dependency folders.
 func (g *GitWorktree) Remove() error {
+	if len(g.linked) > 0 {
+		g.runHook("pause")
+	}
 	for _, l := range g.linked {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
 		if err := l.removeFast(); err != nil {

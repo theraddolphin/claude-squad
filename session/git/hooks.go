@@ -15,6 +15,7 @@ import (
 // HooksDir holds optional executable hooks in the repo cs is launched from:
 //
 //	setup     runs after every session worktree is created or recreated (new and resume)
+//	pause     runs when a session is paused, before its worktrees are removed
 //	teardown  runs when a session is killed, before its worktrees are removed
 //
 // Hooks get CS_SESSION, CS_BRANCH, CS_SLOT, CS_SESSION_DIR, and for each linked repo
