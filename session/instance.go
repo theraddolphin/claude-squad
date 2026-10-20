@@ -515,7 +515,8 @@ func (i *Instance) Resume() error {
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
 	}
-	if i.Status != Paused {
+	// Loading: the UI marks a resume in progress before running it in the background.
+	if i.Status != Paused && i.Status != Loading {
 		return fmt.Errorf("can only resume paused instances")
 	}
 

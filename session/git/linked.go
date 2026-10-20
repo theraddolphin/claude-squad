@@ -2,6 +2,7 @@ package git
 
 import (
 	"bufio"
+	"claude-squad/config"
 	"claude-squad/log"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LinkedReposFile lists other repos that every session should also get a worktree of.
@@ -28,17 +30,20 @@ type LinkedState struct {
 	IsExistingBranch bool   `json:"is_existing_branch"`
 }
 
-// attachLinked reads LinkedReposFile from the repo root and registers linked worktrees (not set up yet).
-func (g *GitWorktree) attachLinked() error {
-	f, err := os.Open(filepath.Join(g.repoPath, LinkedReposFile))
+type linkedRepo struct{ alias, path string }
+
+// readLinkedRepos parses LinkedReposFile in repoRoot; no file means no linked repos.
+func readLinkedRepos(repoRoot string) ([]linkedRepo, error) {
+	f, err := os.Open(filepath.Join(repoRoot, LinkedReposFile))
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", LinkedReposFile, err)
+		return nil, fmt.Errorf("failed to read %s: %w", LinkedReposFile, err)
 	}
 	defer f.Close()
 
+	var repos []linkedRepo
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -47,25 +52,73 @@ func (g *GitWorktree) attachLinked() error {
 		}
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
-			return fmt.Errorf("invalid line in %s: %q (want '<alias> <path>')", LinkedReposFile, line)
+			return nil, fmt.Errorf("invalid line in %s: %q (want '<alias> <path>')", LinkedReposFile, line)
 		}
-		alias, path := fields[0], fields[1]
+		path := fields[1]
 		if !filepath.IsAbs(path) {
-			path = filepath.Join(g.repoPath, path)
+			path = filepath.Join(repoRoot, path)
 		}
-		repo, err := findGitRepoRoot(path)
+		root, err := findGitRepoRoot(path)
 		if err != nil {
-			return fmt.Errorf("linked repo %s: %w", alias, err)
+			return nil, fmt.Errorf("linked repo %s: %w", fields[0], err)
 		}
+		repos = append(repos, linkedRepo{alias: fields[0], path: root})
+	}
+	return repos, scanner.Err()
+}
+
+// attachLinked registers (but does not set up) a worktree per repo in LinkedReposFile.
+func (g *GitWorktree) attachLinked() error {
+	repos, err := readLinkedRepos(g.repoPath)
+	if err != nil {
+		return err
+	}
+	for _, r := range repos {
 		g.linked = append(g.linked, &GitWorktree{
-			repoPath:     repo,
-			worktreePath: g.worktreePath + "." + alias,
+			repoPath:     r.path,
+			worktreePath: g.worktreePath + "." + r.alias,
 			sessionName:  g.sessionName,
 			branchName:   g.branchName,
-			alias:        alias,
+			alias:        r.alias,
 		})
 	}
-	return scanner.Err()
+	return nil
+}
+
+// SearchBranchesAll is SearchBranches over the launch repo and its linked repos, so an
+// existing api or web branch can be picked even if the launch repo has never seen it.
+func SearchBranchesAll(dir, filter string) ([]string, error) {
+	root, err := findGitRepoRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	repos, err := readLinkedRepos(root)
+	if err != nil || len(repos) == 0 {
+		return SearchBranches(root, filter)
+	}
+	seen := make(map[string]bool)
+	var all []string
+	for _, path := range append([]string{root}, linkedPaths(repos)...) {
+		branches, err := SearchBranches(path, filter)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range branches {
+			if !seen[b] && len(all) < MaxBranchSearchResults {
+				seen[b] = true
+				all = append(all, b)
+			}
+		}
+	}
+	return all, nil
+}
+
+func linkedPaths(repos []linkedRepo) []string {
+	var paths []string
+	for _, r := range repos {
+		paths = append(paths, r.path)
+	}
+	return paths
 }
 
 // LinkedStates returns the serializable state of the linked worktrees.
@@ -111,6 +164,11 @@ func (g *GitWorktree) Setup() error {
 	// With linked repos, Setup also runs on resume when only one side is missing,
 	// so never recreate a worktree that is still intact (it would drop uncommitted work).
 	if valid, _ := g.IsValidWorktreeSelf(); !valid || len(g.linked) == 0 {
+		// A branch picked from a linked repo may not exist in the launch repo yet;
+		// create it there (and own it, so kill removes it) instead of failing.
+		if g.isExistingBranch && len(g.linked) > 0 && !g.branchExists() {
+			g.isExistingBranch = false
+		}
 		if err := g.SetupSelf(); err != nil {
 			return err
 		}
@@ -131,6 +189,7 @@ func (g *GitWorktree) Setup() error {
 	if err := g.claimSlot(); err != nil {
 		return err
 	}
+	g.writeSlotRecord()
 	g.runHook("setup")
 	return nil
 }
@@ -145,10 +204,7 @@ func (l *GitWorktree) setupLinked() error {
 	_ = os.RemoveAll(l.worktreePath)
 
 	firstSetup := l.baseCommitSHA == ""
-	_, localErr := l.runGitCommand(l.repoPath, "show-ref", "--verify", "refs/heads/"+l.branchName)
-	_, remoteErr := l.runGitCommand(l.repoPath, "show-ref", "--verify", "refs/remotes/origin/"+l.branchName)
-
-	if localErr == nil || remoteErr == nil {
+	if l.branchExists() {
 		// A branch we didn't create is never deleted on kill.
 		if firstSetup {
 			l.isExistingBranch = true
@@ -174,6 +230,12 @@ func (l *GitWorktree) setupLinked() error {
 	return l.recordBaseCommit()
 }
 
+func (g *GitWorktree) branchExists() bool {
+	_, localErr := g.runGitCommand(g.repoPath, "show-ref", "--verify", "refs/heads/"+g.branchName)
+	_, remoteErr := g.runGitCommand(g.repoPath, "show-ref", "--verify", "refs/remotes/origin/"+g.branchName)
+	return localErr == nil || remoteErr == nil
+}
+
 // defaultRef returns the remote default branch (e.g. origin/main), or HEAD if unknown.
 func (l *GitWorktree) defaultRef() string {
 	out, err := l.runGitCommand(l.repoPath, "rev-parse", "--abbrev-ref", "origin/HEAD")
@@ -192,12 +254,19 @@ func (g *GitWorktree) Cleanup() error {
 	}
 	for _, l := range g.linked {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
+		if err := l.removeFast(); err != nil {
+			errs = append(errs, fmt.Errorf("linked repo %s: %w", l.alias, err))
+		}
 		if err := l.CleanupSelf(); err != nil {
 			errs = append(errs, fmt.Errorf("linked repo %s: %w", l.alias, err))
 		}
 	}
 	if err := g.CleanupSelf(); err != nil {
 		errs = append(errs, err)
+	}
+	if len(g.linked) > 0 {
+		_ = os.Remove(g.worktreePath + ".setup.log")
+		_ = os.Remove(g.worktreePath + ".teardown.log")
 	}
 	if len(errs) > 0 {
 		return g.combineErrors(errs)
@@ -209,13 +278,52 @@ func (g *GitWorktree) Cleanup() error {
 func (g *GitWorktree) Remove() error {
 	for _, l := range g.linked {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
-		if _, err := os.Stat(l.worktreePath); err == nil {
-			if err := l.RemoveSelf(); err != nil {
-				return fmt.Errorf("linked repo %s: %w", l.alias, err)
-			}
+		if err := l.removeFast(); err != nil {
+			return fmt.Errorf("linked repo %s: %w", l.alias, err)
 		}
 	}
 	return g.RemoveSelf()
+}
+
+// removeFast removes a linked worktree without blocking on deleting its files: linked
+// worktrees hold big trees like node_modules, and `git worktree remove` deletes them inline
+// (pause and kill froze the UI ~10s). The folder is moved to trash, git forgets it, and the
+// files are deleted in the background. Callers commit first; uncommitted work is dropped,
+// same as `git worktree remove -f`.
+func (l *GitWorktree) removeFast() error {
+	if _, err := os.Stat(l.worktreePath); os.IsNotExist(err) {
+		return nil
+	}
+	trashRoot, err := trashDir()
+	if err != nil {
+		return l.RemoveSelf()
+	}
+	trash := filepath.Join(trashRoot, fmt.Sprintf("%s_%d", filepath.Base(l.worktreePath), time.Now().UnixNano()))
+	if err := os.Rename(l.worktreePath, trash); err != nil {
+		return l.RemoveSelf()
+	}
+	if err := l.PruneSelf(); err != nil {
+		return err
+	}
+	go emptyTrash(trashRoot)
+	return nil
+}
+
+func trashDir() (string, error) {
+	dir, err := config.GetConfigDir()
+	if err != nil {
+		return "", err
+	}
+	dir = filepath.Join(dir, "trash")
+	return dir, os.MkdirAll(dir, 0755)
+}
+
+// emptyTrash deletes everything in trash, including leftovers from a cs that exited mid-delete.
+func emptyTrash(trashRoot string) {
+	entries, _ := os.ReadDir(trashRoot)
+	for _, e := range entries {
+		_ = os.RemoveAll(filepath.Join(trashRoot, e.Name()))
+	}
 }
 
 // Prune prunes worktree metadata in every repo.

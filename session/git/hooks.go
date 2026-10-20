@@ -3,6 +3,7 @@ package git
 import (
 	"claude-squad/config"
 	"claude-squad/log"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -54,6 +55,72 @@ func (g *GitWorktree) claimSlot() error {
 		return nil
 	}
 	return fmt.Errorf("no free port slot (all %d in use, see %s)", maxSlots, dir)
+}
+
+// slotRecord is what a slot file holds: enough to tear the session down without cs storage
+// (used by `cs reset`, which wipes storage first).
+type slotRecord struct {
+	RepoPath         string        `json:"repo_path"`
+	WorktreePath     string        `json:"worktree_path"`
+	SessionName      string        `json:"session_name"`
+	BranchName       string        `json:"branch_name"`
+	BaseCommitSHA    string        `json:"base_commit_sha"`
+	IsExistingBranch bool          `json:"is_existing_branch"`
+	Slot             int           `json:"slot"`
+	Linked           []LinkedState `json:"linked"`
+}
+
+// writeSlotRecord refreshes the slot file with the session's current state.
+func (g *GitWorktree) writeSlotRecord() {
+	dir, err := slotsDir()
+	if err != nil || g.slot == 0 {
+		return
+	}
+	data, err := json.Marshal(slotRecord{
+		RepoPath:         g.repoPath,
+		WorktreePath:     g.worktreePath,
+		SessionName:      g.sessionName,
+		BranchName:       g.branchName,
+		BaseCommitSHA:    g.baseCommitSHA,
+		IsExistingBranch: g.isExistingBranch,
+		Slot:             g.slot,
+		Linked:           g.LinkedStates(),
+	})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(g.slot)), data, 0644); err != nil {
+		log.ErrorLog.Printf("failed to write slot record: %v", err)
+	}
+}
+
+// cleanupLinkedSessions fully tears down every linked-repo session that holds a slot:
+// teardown hook, linked worktrees and the branches it created, then the slot itself.
+func cleanupLinkedSessions() {
+	dir, err := slotsDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(path)
+		var rec slotRecord
+		if err != nil || json.Unmarshal(data, &rec) != nil || rec.RepoPath == "" {
+			_ = os.Remove(path)
+			continue
+		}
+		g := NewGitWorktreeFromStorage(rec.RepoPath, rec.WorktreePath, rec.SessionName, rec.BranchName, rec.BaseCommitSHA, rec.IsExistingBranch)
+		g.SetLinkedStates(rec.Linked)
+		g.SetSlot(rec.Slot)
+		if err := g.Cleanup(); err != nil {
+			log.ErrorLog.Printf("reset: cleanup of %s: %v", rec.SessionName, err)
+		}
+		_ = os.Remove(path)
+	}
 }
 
 func (g *GitWorktree) releaseSlot() {

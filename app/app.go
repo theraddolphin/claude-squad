@@ -237,8 +237,9 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
 	case metadataUpdateDoneMsg:
 		for _, r := range msg.results {
-			// Skip instances that were paused while metadata was being computed
-			if r.instance.Status == session.Paused {
+			// Skip instances that were paused while metadata was being computed, and ones
+			// mid start/resume (a resuming instance's old tmux pane would flip it to Running).
+			if r.instance.Status == session.Paused || r.instance.Status == session.Loading {
 				continue
 			}
 			if r.updated {
@@ -301,6 +302,14 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case instanceResumedMsg:
+		if msg.err != nil {
+			return m, tea.Batch(m.handleError(msg.err), m.instanceChanged())
+		}
+		if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+			return m, m.handleError(err)
+		}
+		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -772,10 +781,19 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
 		}
-		if err := selected.Resume(); err != nil {
-			return m, m.handleError(err)
+		if !selected.Paused() {
+			return m, nil
 		}
-		return m, tea.WindowSize()
+		// Resume recreates worktrees and reruns setup hooks, which can take a while,
+		// so run it off the UI goroutine like Start.
+		selected.SetStatus(session.Loading)
+		return m, func() tea.Msg {
+			err := selected.Resume()
+			if err != nil {
+				selected.SetStatus(session.Paused)
+			}
+			return instanceResumedMsg{instance: selected, err: err}
+		}
 	case keys.KeyEnter:
 		if m.list.NumInstances() == 0 {
 			return m, nil
@@ -858,6 +876,12 @@ type previewTickMsg struct{}
 
 type instanceChangedMsg struct{}
 
+// instanceResumedMsg is sent when a background Resume finishes.
+type instanceResumedMsg struct {
+	instance *session.Instance
+	err      error
+}
+
 type instanceStartedMsg struct {
 	instance        *session.Instance
 	err             error
@@ -891,7 +915,7 @@ func (m *home) scheduleBranchSearch(filter string, version uint64) tea.Cmd {
 func (m *home) runBranchSearch(filter string, version uint64) tea.Cmd {
 	return func() tea.Msg {
 		currentDir, _ := os.Getwd()
-		branches, err := git.SearchBranches(currentDir, filter)
+		branches, err := git.SearchBranchesAll(currentDir, filter)
 		if err != nil {
 			log.WarningLog.Printf("branch search failed: %v", err)
 			return nil

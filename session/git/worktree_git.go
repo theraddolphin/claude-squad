@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // MaxBranchSearchResults is the maximum number of branches returned by SearchBranches.
@@ -57,9 +58,18 @@ func SearchBranches(repoPath, filter string) ([]string, error) {
 // runGitCommand executes a git command and returns any error
 func (g *GitWorktree) runGitCommand(path string, args ...string) (string, error) {
 	baseArgs := []string{"-C", path}
-	cmd := exec.Command("git", append(baseArgs, args...)...)
-
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	var err error
+	// The background diff refresh (`git add -N .`) briefly holds index.lock; a commit or
+	// diff landing at the same moment would fail, so wait it out instead.
+	for attempt := 0; attempt < 20; attempt++ {
+		cmd := exec.Command("git", append(baseArgs, args...)...)
+		output, err = cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "index.lock': File exists") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		return "", fmt.Errorf("git command failed: %s (%w)", output, err)
 	}

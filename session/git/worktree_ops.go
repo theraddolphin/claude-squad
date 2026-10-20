@@ -169,6 +169,8 @@ func (g *GitWorktree) PruneSelf() error {
 
 // CleanupWorktrees removes all worktrees and their associated branches
 func CleanupWorktrees() error {
+	cleanupLinkedSessions()
+
 	worktreesDir, err := getWorktreeDirectory()
 	if err != nil {
 		return fmt.Errorf("failed to get worktree directory: %w", err)
