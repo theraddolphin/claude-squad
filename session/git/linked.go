@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"claude-squad/config"
 	"claude-squad/log"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,15 +12,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// LinkedReposFile lists other repos that every session should also get a worktree of.
-// It lives at the root of the repo cs is launched from. One repo per line:
+// LinkedReposFile lists other repos a session can get a worktree of. It lives at the root of
+// the repo cs is launched from; its presence makes every session a multi-repo session.
+// One repo per line:
 //
-//	<alias> <path>
+//	<alias> <path> [auto]
 //
-// The path may be absolute or relative to the repo root. Lines starting with # are ignored.
+// Repos are linked on demand (`cs link <alias>` from inside a session); `auto` creates the
+// worktree up front for every session. The path may be absolute or relative to the repo
+// root. Lines starting with # are ignored.
 const LinkedReposFile = ".claude-squad-repos"
 
 // LinkedState is the serializable state of one linked worktree.
@@ -31,7 +36,10 @@ type LinkedState struct {
 	IsExistingBranch bool   `json:"is_existing_branch"`
 }
 
-type linkedRepo struct{ alias, path string }
+type linkedRepo struct {
+	alias, path string
+	auto        bool
+}
 
 // readLinkedRepos parses LinkedReposFile in repoRoot; no file means no linked repos.
 func readLinkedRepos(repoRoot string) ([]linkedRepo, error) {
@@ -52,8 +60,8 @@ func readLinkedRepos(repoRoot string) ([]linkedRepo, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			return nil, fmt.Errorf("invalid line in %s: %q (want '<alias> <path>')", LinkedReposFile, line)
+		if len(fields) < 2 || len(fields) > 3 || (len(fields) == 3 && fields[2] != "auto") {
+			return nil, fmt.Errorf("invalid line in %s: %q (want '<alias> <path> [auto]')", LinkedReposFile, line)
 		}
 		path := fields[1]
 		if !filepath.IsAbs(path) {
@@ -63,32 +71,186 @@ func readLinkedRepos(repoRoot string) ([]linkedRepo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("linked repo %s: %w", fields[0], err)
 		}
-		repos = append(repos, linkedRepo{alias: fields[0], path: root})
+		repos = append(repos, linkedRepo{alias: fields[0], path: root, auto: len(fields) == 3})
 	}
 	return repos, scanner.Err()
 }
 
-// attachLinked registers (but does not set up) a worktree per repo in LinkedReposFile.
+// attachLinked registers (but does not set up) worktrees for the `auto` repos in
+// LinkedReposFile; the rest are linked on demand with Link.
 func (g *GitWorktree) attachLinked() error {
 	repos, err := readLinkedRepos(g.repoPath)
 	if err != nil {
 		return err
 	}
-	if len(repos) > 0 {
+	if g.isMulti() {
 		if trashRoot, err := trashDir(); err == nil {
 			go emptyTrash(trashRoot) // leftovers from a cs that quit mid-delete
 		}
 	}
 	for _, r := range repos {
-		g.linked = append(g.linked, &GitWorktree{
-			repoPath:     r.path,
-			worktreePath: g.worktreePath + "." + r.alias,
-			sessionName:  g.sessionName,
-			branchName:   g.branchName,
-			alias:        r.alias,
-		})
+		if r.auto {
+			g.linked = append(g.linked, g.newLinked(r))
+		}
 	}
 	return nil
+}
+
+func (g *GitWorktree) newLinked(r linkedRepo) *GitWorktree {
+	return &GitWorktree{
+		repoPath:     r.path,
+		worktreePath: g.worktreePath + "." + r.alias,
+		sessionName:  g.sessionName,
+		branchName:   g.branchName,
+		alias:        r.alias,
+	}
+}
+
+// isMulti reports whether this is a multi-repo session (the launch repo has LinkedReposFile),
+// even before any repo is linked.
+func (g *GitWorktree) isMulti() bool {
+	if g.alias != "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(g.repoPath, LinkedReposFile))
+	return err == nil
+}
+
+// markerDir holds one <alias>.json per linked worktree. It is how a running cs learns about
+// repos linked from inside the session (`cs link`), and it survives pause.
+func (g *GitWorktree) markerDir() string { return g.worktreePath + ".linked" }
+
+func (g *GitWorktree) writeMarker(l *GitWorktree) {
+	if err := os.MkdirAll(g.markerDir(), 0755); err != nil {
+		log.ErrorLog.Printf("linked marker: %v", err)
+		return
+	}
+	data, _ := json.Marshal(l.state())
+	if err := os.WriteFile(filepath.Join(g.markerDir(), l.alias+".json"), data, 0644); err != nil {
+		log.ErrorLog.Printf("linked marker: %v", err)
+	}
+}
+
+// links returns the linked worktrees, first picking up any linked from outside this process.
+func (g *GitWorktree) links() []*GitWorktree {
+	g.linkedMu.Lock()
+	defer g.linkedMu.Unlock()
+	if entries, err := os.ReadDir(g.markerDir()); err == nil {
+		known := make(map[string]bool)
+		for _, l := range g.linked { // already holding linkedMu: do not call links() here
+			known[l.alias] = true
+		}
+		for _, e := range entries {
+			alias := strings.TrimSuffix(e.Name(), ".json")
+			if known[alias] || alias == e.Name() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(g.markerDir(), e.Name()))
+			var st LinkedState
+			if err != nil || json.Unmarshal(data, &st) != nil {
+				continue
+			}
+			g.linked = append(g.linked, g.fromState(st))
+		}
+	}
+	return append([]*GitWorktree(nil), g.linked...)
+}
+
+func (l *GitWorktree) state() LinkedState {
+	return LinkedState{
+		Alias:            l.alias,
+		RepoPath:         l.repoPath,
+		WorktreePath:     l.worktreePath,
+		BaseCommitSHA:    l.baseCommitSHA,
+		IsExistingBranch: l.isExistingBranch,
+	}
+}
+
+func (g *GitWorktree) fromState(s LinkedState) *GitWorktree {
+	return &GitWorktree{
+		repoPath:         s.RepoPath,
+		worktreePath:     s.WorktreePath,
+		sessionName:      g.sessionName,
+		branchName:       g.branchName,
+		baseCommitSHA:    s.BaseCommitSHA,
+		isExistingBranch: s.IsExistingBranch,
+		alias:            s.Alias,
+	}
+}
+
+// Link adds a worktree of the LinkedReposFile repo `alias` to the session, on the session
+// branch, exposed as ./<alias>. Linking an already linked repo just makes sure it is there.
+// It returns the path inside the session.
+func (g *GitWorktree) Link(alias string) (string, error) {
+	repos, err := readLinkedRepos(g.repoPath)
+	if err != nil {
+		return "", err
+	}
+	var repo *linkedRepo
+	var names []string
+	for i := range repos {
+		names = append(names, repos[i].alias)
+		if repos[i].alias == alias {
+			repo = &repos[i]
+		}
+	}
+	if repo == nil {
+		return "", fmt.Errorf("unknown repo %q; available: %s", alias, strings.Join(names, ", "))
+	}
+	var l *GitWorktree
+	for _, existing := range g.links() {
+		if existing.alias == alias {
+			l = existing
+		}
+	}
+	if l == nil {
+		l = g.newLinked(*repo)
+	}
+	if err := g.attach(l); err != nil {
+		return "", err
+	}
+	g.linkedMu.Lock()
+	found := false
+	for _, existing := range g.linked {
+		found = found || existing.alias == alias
+	}
+	if !found {
+		g.linked = append(g.linked, l)
+	}
+	g.linkedMu.Unlock()
+	g.writeSlotRecord()
+	g.runHook("setup") // so per-repo config (env files etc.) is written for the new repo
+	return filepath.Join(g.worktreePath, alias), nil
+}
+
+// attach sets up a linked worktree, symlinks it into the session and records its marker.
+func (g *GitWorktree) attach(l *GitWorktree) error {
+	if err := l.setupLinked(); err != nil {
+		return fmt.Errorf("linked repo %s: %w", l.alias, err)
+	}
+	link := filepath.Join(g.worktreePath, l.alias)
+	_ = os.Remove(link)
+	if err := os.Symlink(l.worktreePath, link); err != nil {
+		return fmt.Errorf("failed to link %s into session: %w", l.alias, err)
+	}
+	g.writeMarker(l)
+	return nil
+}
+
+// LinkedAliases lists the available repos and whether each is linked in this session.
+func (g *GitWorktree) LinkedAliases() (available []string, linked map[string]bool, err error) {
+	repos, err := readLinkedRepos(g.repoPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	linked = make(map[string]bool)
+	for _, l := range g.links() {
+		linked[l.alias] = true
+	}
+	for _, r := range repos {
+		available = append(available, r.alias)
+	}
+	return available, linked, nil
 }
 
 // SearchBranchesAll is SearchBranches over the launch repo and its linked repos, so an
@@ -103,13 +265,25 @@ func SearchBranchesAll(dir, filter string) ([]string, error) {
 	if err != nil || len(repos) == 0 {
 		return SearchBranches(root, filter)
 	}
+	// One `git branch` per repo, in parallel: sequentially it adds up (~1.3s for 13 repos).
+	paths := append([]string{root}, linkedPaths(repos)...)
+	outs := make([][]byte, len(paths))
+	errs := make([]error, len(paths))
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			outs[i], errs[i] = exec.Command("git", "-C", path, "branch", "-a",
+				"--format=%(committerdate:unix) %(refname:short)").CombinedOutput()
+		}(i, path)
+	}
+	wg.Wait()
 	latest := make(map[string]int64) // branch -> newest commit time in any repo
 	lower := strings.ToLower(filter)
-	for _, path := range append([]string{root}, linkedPaths(repos)...) {
-		out, err := exec.Command("git", "-C", path, "branch", "-a",
-			"--format=%(committerdate:unix) %(refname:short)").CombinedOutput()
-		if err != nil {
-			return nil, fmt.Errorf("failed to list branches in %s: %s (%w)", path, out, err)
+	for i, out := range outs {
+		if errs[i] != nil {
+			return nil, fmt.Errorf("failed to list branches in %s: %s (%w)", paths[i], out, errs[i])
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			ts, ref, ok := strings.Cut(strings.TrimSpace(line), " ")
@@ -152,14 +326,8 @@ func linkedPaths(repos []linkedRepo) []string {
 // LinkedStates returns the serializable state of the linked worktrees.
 func (g *GitWorktree) LinkedStates() []LinkedState {
 	var states []LinkedState
-	for _, l := range g.linked {
-		states = append(states, LinkedState{
-			Alias:            l.alias,
-			RepoPath:         l.repoPath,
-			WorktreePath:     l.worktreePath,
-			BaseCommitSHA:    l.baseCommitSHA,
-			IsExistingBranch: l.isExistingBranch,
-		})
+	for _, l := range g.links() {
+		states = append(states, l.state())
 	}
 	return states
 }
@@ -172,17 +340,11 @@ func (g *GitWorktree) SetSlot(slot int) { g.slot = slot }
 
 // SetLinkedStates restores linked worktrees from storage.
 func (g *GitWorktree) SetLinkedStates(states []LinkedState) {
+	g.linkedMu.Lock()
+	defer g.linkedMu.Unlock()
 	g.linked = nil
 	for _, s := range states {
-		g.linked = append(g.linked, &GitWorktree{
-			repoPath:         s.RepoPath,
-			worktreePath:     s.WorktreePath,
-			sessionName:      g.sessionName,
-			branchName:       g.branchName,
-			baseCommitSHA:    s.BaseCommitSHA,
-			isExistingBranch: s.IsExistingBranch,
-			alias:            s.Alias,
-		})
+		g.linked = append(g.linked, g.fromState(s))
 	}
 }
 
@@ -191,27 +353,23 @@ func (g *GitWorktree) SetLinkedStates(states []LinkedState) {
 func (g *GitWorktree) Setup() error {
 	// With linked repos, Setup also runs on resume when only one side is missing,
 	// so never recreate a worktree that is still intact (it would drop uncommitted work).
-	if valid, _ := g.IsValidWorktreeSelf(); !valid || len(g.linked) == 0 {
+	multi := g.isMulti()
+	if valid, _ := g.IsValidWorktreeSelf(); !valid || !multi {
 		// A branch picked from a linked repo may not exist in the launch repo yet;
 		// create it there (and own it, so kill removes it) instead of failing.
-		if g.isExistingBranch && len(g.linked) > 0 && !g.branchExists() {
+		if g.isExistingBranch && multi && !g.branchExists() {
 			g.isExistingBranch = false
 		}
 		if err := g.SetupSelf(); err != nil {
 			return err
 		}
 	}
-	for _, l := range g.linked {
-		if err := l.setupLinked(); err != nil {
-			return fmt.Errorf("linked repo %s: %w", l.alias, err)
-		}
-		link := filepath.Join(g.worktreePath, l.alias)
-		_ = os.Remove(link)
-		if err := os.Symlink(l.worktreePath, link); err != nil {
-			return fmt.Errorf("failed to link %s into session: %w", l.alias, err)
+	for _, l := range g.links() {
+		if err := g.attach(l); err != nil {
+			return err
 		}
 	}
-	if len(g.linked) == 0 {
+	if !multi {
 		return nil
 	}
 	if err := g.claimSlot(); err != nil {
@@ -276,11 +434,13 @@ func (l *GitWorktree) defaultRef() string {
 // Cleanup removes all worktrees and the branches this session created.
 func (g *GitWorktree) Cleanup() error {
 	var errs []error
-	if len(g.linked) > 0 {
+	multi := g.isMulti()
+	links := g.links()
+	if multi {
 		g.runHook("teardown")
 		g.releaseSlot()
 	}
-	for _, l := range g.linked {
+	for _, l := range links {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
 		if err := l.removeFast(); err != nil {
 			errs = append(errs, fmt.Errorf("linked repo %s: %w", l.alias, err))
@@ -292,10 +452,11 @@ func (g *GitWorktree) Cleanup() error {
 	if err := g.CleanupSelf(); err != nil {
 		errs = append(errs, err)
 	}
-	if len(g.linked) > 0 {
+	if multi {
 		for _, hook := range []string{"setup", "pause", "teardown"} {
 			_ = os.Remove(g.worktreePath + "." + hook + ".log")
 		}
+		_ = os.RemoveAll(g.markerDir())
 	}
 	if len(errs) > 0 {
 		return g.combineErrors(errs)
@@ -306,10 +467,10 @@ func (g *GitWorktree) Cleanup() error {
 // Remove removes all worktrees but keeps their branches (pause). The pause hook runs first
 // so it can set aside untracked state worth keeping, like dependency folders.
 func (g *GitWorktree) Remove() error {
-	if len(g.linked) > 0 {
+	if g.isMulti() {
 		g.runHook("pause")
 	}
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		_ = os.Remove(filepath.Join(g.worktreePath, l.alias))
 		if err := l.removeFast(); err != nil {
 			return fmt.Errorf("linked repo %s: %w", l.alias, err)
@@ -361,7 +522,7 @@ func emptyTrash(trashRoot string) {
 
 // Prune prunes worktree metadata in every repo.
 func (g *GitWorktree) Prune() error {
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		if err := l.PruneSelf(); err != nil {
 			return fmt.Errorf("linked repo %s: %w", l.alias, err)
 		}
@@ -371,7 +532,7 @@ func (g *GitWorktree) Prune() error {
 
 // IsValidWorktree reports whether every worktree of the session is intact.
 func (g *GitWorktree) IsValidWorktree() (bool, error) {
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		if valid, err := l.IsValidWorktreeSelf(); err != nil || !valid {
 			return valid, err
 		}
@@ -381,7 +542,7 @@ func (g *GitWorktree) IsValidWorktree() (bool, error) {
 
 // IsBranchCheckedOut reports whether the session branch is checked out in any main checkout.
 func (g *GitWorktree) IsBranchCheckedOut() (bool, error) {
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		if checked, err := l.IsBranchCheckedOutSelf(); err != nil || checked {
 			return checked, err
 		}
@@ -391,7 +552,7 @@ func (g *GitWorktree) IsBranchCheckedOut() (bool, error) {
 
 // IsDirty reports whether any worktree of the session has uncommitted changes.
 func (g *GitWorktree) IsDirty() (bool, error) {
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		if dirty, err := l.IsDirtySelf(); err != nil || dirty {
 			return dirty, err
 		}
@@ -401,7 +562,7 @@ func (g *GitWorktree) IsDirty() (bool, error) {
 
 // CommitChanges commits uncommitted changes in every worktree.
 func (g *GitWorktree) CommitChanges(commitMessage string) error {
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		if err := l.CommitChangesSelf(commitMessage); err != nil {
 			return fmt.Errorf("linked repo %s: %w", l.alias, err)
 		}
@@ -412,14 +573,14 @@ func (g *GitWorktree) CommitChanges(commitMessage string) error {
 // PushChanges commits and pushes every worktree that has work on the branch. Linked repos
 // with nothing beyond their default branch are skipped, as is a session repo with no remote.
 func (g *GitWorktree) PushChanges(commitMessage string, open bool) error {
-	if len(g.linked) == 0 {
+	if !g.isMulti() {
 		return g.PushChangesSelf(commitMessage, open)
 	}
 	if err := g.CommitChanges(commitMessage); err != nil {
 		return err
 	}
 	pushed := 0
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		ok, err := l.pushLinked(open)
 		if err != nil {
 			return fmt.Errorf("linked repo %s: %w", l.alias, err)
@@ -463,7 +624,7 @@ func (l *GitWorktree) pushLinked(open bool) (bool, error) {
 // paths prefixed by their alias (e.g. api/squadhealth/models.py).
 func (g *GitWorktree) Diff() *DiffStats {
 	stats := g.DiffSelf()
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		ls := l.linkedDiff(false)
 		mergeStats(stats, ls)
 	}
@@ -473,7 +634,7 @@ func (g *GitWorktree) Diff() *DiffStats {
 // DiffNumstat returns line counts across the session repo and every linked repo.
 func (g *GitWorktree) DiffNumstat() *DiffStats {
 	stats := g.DiffNumstatSelf()
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		mergeStats(stats, l.linkedDiff(true))
 	}
 	return stats

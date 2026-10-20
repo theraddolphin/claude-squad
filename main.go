@@ -135,6 +135,49 @@ var (
 		},
 	}
 
+	linkCmd = &cobra.Command{
+		Use:   "link [repo]",
+		Short: "Add a repo worktree to the current multi-repo session (no repo: list repos)",
+		Args:  cobra.MaximumNArgs(1),
+		// Errors here are for the agent/user in a session shell: no usage dump.
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Initialize(false) // not closed: Close prints a "wrote logs" line
+			dir := os.Getenv("CS_SESSION_DIR")
+			if dir == "" {
+				var err error
+				if dir, err = os.Getwd(); err != nil {
+					return err
+				}
+			}
+			g, err := git.OpenSession(dir)
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				available, linked, err := g.LinkedAliases()
+				if err != nil {
+					return err
+				}
+				for _, a := range available {
+					mark := " "
+					if linked[a] {
+						mark = "*"
+					}
+					fmt.Printf("%s %s\n", mark, a)
+				}
+				fmt.Println("(* = linked in this session; link one with: link <repo>)")
+				return nil
+			}
+			path, err := g.Link(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Printf("linked %s at %s (branch %s)\n", args[0], path, g.GetBranchName())
+			return nil
+		},
+	}
+
 	versionCmd = &cobra.Command{
 		Use:   "version",
 		Short: "Print the version number",
@@ -162,6 +205,7 @@ func init() {
 	rootCmd.AddCommand(debugCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
+	rootCmd.AddCommand(linkCmd)
 }
 
 func main() {

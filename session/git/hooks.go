@@ -124,6 +124,44 @@ func cleanupLinkedSessions() {
 	}
 }
 
+// OpenSession finds the multi-repo session whose folder contains dir (e.g. the shell's working
+// directory inside a session) from its slot record, so CLI commands can act on it while the
+// cs UI runs. dir may be inside a linked repo's folder.
+func OpenSession(dir string) (*GitWorktree, error) {
+	slots, err := slotsDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, _ := os.ReadDir(slots)
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+	dir = resolve(dir)
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join(slots, e.Name()))
+		var rec slotRecord
+		if err != nil || json.Unmarshal(data, &rec) != nil || rec.WorktreePath == "" {
+			continue
+		}
+		g := NewGitWorktreeFromStorage(rec.RepoPath, rec.WorktreePath, rec.SessionName, rec.BranchName, rec.BaseCommitSHA, rec.IsExistingBranch)
+		g.SetLinkedStates(rec.Linked)
+		g.SetSlot(rec.Slot)
+		roots := []string{resolve(rec.WorktreePath)}
+		for _, l := range g.links() {
+			roots = append(roots, resolve(l.worktreePath))
+		}
+		for _, root := range roots {
+			if dir == root || strings.HasPrefix(dir, root+string(os.PathSeparator)) {
+				return g, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("%s is not inside a claude-squad multi-repo session", dir)
+}
+
 func (g *GitWorktree) releaseSlot() {
 	if g.slot == 0 {
 		return
@@ -145,7 +183,7 @@ func (g *GitWorktree) runHook(name string) {
 		"CS_SLOT="+strconv.Itoa(g.slot),
 		"CS_SESSION_DIR="+g.worktreePath,
 	)
-	for _, l := range g.linked {
+	for _, l := range g.links() {
 		key := strings.ToUpper(strings.ReplaceAll(l.alias, "-", "_"))
 		env = append(env, "CS_REPO_"+key+"="+l.worktreePath, "CS_MAIN_"+key+"="+l.repoPath)
 	}

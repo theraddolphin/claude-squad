@@ -5,6 +5,7 @@ import (
 	"claude-squad/log"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -34,8 +35,10 @@ type GitWorktree struct {
 	isExistingBranch bool
 	// alias is the directory name a linked worktree is exposed as inside its parent.
 	alias string
-	// linked holds worktrees of other repos that share this session's branch.
-	linked []*GitWorktree
+	// linked holds worktrees of other repos that share this session's branch; guarded by
+	// linkedMu because the background diff refresh reads it while repos get linked.
+	linked   []*GitWorktree
+	linkedMu sync.Mutex
 	// slot is this session's port slot (1-based, 0 = none); only sessions with linked repos get one.
 	slot int
 }
