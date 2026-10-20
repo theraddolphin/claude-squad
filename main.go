@@ -140,7 +140,8 @@ var (
 		Short: "Add a repo worktree to the current multi-repo session (no repo: list repos)",
 		Args:  cobra.MaximumNArgs(1),
 		// Errors here are for the agent/user in a session shell: no usage dump.
-		SilenceUsage: true,
+		SilenceUsage:  true,
+		SilenceErrors: true, // main prints the error
 		RunE: func(cmd *cobra.Command, args []string) error {
 			log.Initialize(false) // not closed: Close prints a "wrote logs" line
 			dir := os.Getenv("CS_SESSION_DIR")
