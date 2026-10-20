@@ -73,6 +73,11 @@ func (g *GitWorktree) attachLinked() error {
 	if err != nil {
 		return err
 	}
+	if len(repos) > 0 {
+		if trashRoot, err := trashDir(); err == nil {
+			go emptyTrash(trashRoot) // leftovers from a cs that quit mid-delete
+		}
+	}
 	for _, r := range repos {
 		g.linked = append(g.linked, &GitWorktree{
 			repoPath:     r.path,
