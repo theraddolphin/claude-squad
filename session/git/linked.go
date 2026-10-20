@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -92,6 +93,7 @@ func (g *GitWorktree) attachLinked() error {
 
 // SearchBranchesAll is SearchBranches over the launch repo and its linked repos, so an
 // existing api or web branch can be picked even if the launch repo has never seen it.
+// Like SearchBranches, results are most recently committed first, across all repos.
 func SearchBranchesAll(dir, filter string) ([]string, error) {
 	root, err := findGitRepoRoot(dir)
 	if err != nil {
@@ -101,19 +103,40 @@ func SearchBranchesAll(dir, filter string) ([]string, error) {
 	if err != nil || len(repos) == 0 {
 		return SearchBranches(root, filter)
 	}
-	seen := make(map[string]bool)
-	var all []string
+	latest := make(map[string]int64) // branch -> newest commit time in any repo
+	lower := strings.ToLower(filter)
 	for _, path := range append([]string{root}, linkedPaths(repos)...) {
-		branches, err := SearchBranches(path, filter)
+		out, err := exec.Command("git", "-C", path, "branch", "-a",
+			"--format=%(committerdate:unix) %(refname:short)").CombinedOutput()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list branches in %s: %s (%w)", path, out, err)
 		}
-		for _, b := range branches {
-			if !seen[b] && len(all) < MaxBranchSearchResults {
-				seen[b] = true
-				all = append(all, b)
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			ts, ref, ok := strings.Cut(strings.TrimSpace(line), " ")
+			if !ok || strings.Contains(ref, "HEAD") {
+				continue
+			}
+			name := strings.TrimPrefix(ref, "origin/")
+			if filter != "" && !strings.Contains(strings.ToLower(name), lower) {
+				continue
+			}
+			if t, _ := strconv.ParseInt(ts, 10, 64); t > latest[name] || latest[name] == 0 {
+				latest[name] = t
 			}
 		}
+	}
+	all := make([]string, 0, len(latest))
+	for name := range latest {
+		all = append(all, name)
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if latest[all[i]] != latest[all[j]] {
+			return latest[all[i]] > latest[all[j]]
+		}
+		return all[i] < all[j]
+	})
+	if len(all) > MaxBranchSearchResults {
+		all = all[:MaxBranchSearchResults]
 	}
 	return all, nil
 }
